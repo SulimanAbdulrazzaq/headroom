@@ -1991,3 +1991,99 @@ def test_datetime_prefixed_user_prompt_survives_router() -> None:
     result = ContentRouter().compress(prompt)
     assert result.strategy_used is not CompressionStrategy.SEARCH
     assert "Please update the PR desc" in result.compressed
+
+
+def _stub_embedded_router(monkeypatch: pytest.MonkeyPatch, routed: str | None) -> list[str]:
+    """Make the embedded-JSON pre-pass return ``routed`` deterministically.
+
+    ``_apply_strategy_to_content`` imports ``route_embedded_json`` at call time,
+    so patching the module attribute is enough and the real span scanner (which
+    needs the native detector) never runs.
+    """
+    import headroom.transforms.recursive_json as recursive_json
+
+    seen: list[str] = []
+
+    def fake_route(content: str, _dispatch: object, tok: object = None) -> str | None:
+        seen.append(content)
+        return routed
+
+    monkeypatch.setattr(recursive_json, "route_embedded_json", fake_route)
+    return seen
+
+
+def test_embedded_json_does_not_preempt_the_html_extractor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3609: a local embedded-JSON win must not skip document-level extraction.
+
+    The pre-pass returned early, so a page whose embedded JSON shrank never
+    reached HTMLExtractor — trading a ~2% win for the ~95% one.
+    """
+    router = ContentRouter()
+    page = '<html><body><p>Hi</p><script>{"a": 1}</script></body></html>'
+    seen = _stub_embedded_router(monkeypatch, "<EMBEDDED-JSON-ROUTED>")
+
+    monkeypatch.setattr(router, "_get_html_extractor", lambda: object())
+    monkeypatch.setattr(
+        router,
+        "_registry_compress",
+        lambda *_a, **_kw: SimpleNamespace(content="<HTML-EXTRACTED>", compressed=True),
+    )
+
+    compressed, _tokens, strategy_chain = router._apply_strategy_to_content(
+        page,
+        CompressionStrategy.HTML,
+        context="",
+    )
+
+    assert seen == [page]
+    assert compressed == "<HTML-EXTRACTED>"
+    assert "embedded_json" not in strategy_chain
+
+
+def test_embedded_json_is_banked_when_html_extraction_yields_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Holding the embedded result back must not throw it away.
+
+    When HTMLExtractor extracts nothing the branch falls through to
+    passthrough, so the embedded-JSON result is used instead of returning the
+    content unchanged.
+    """
+    router = ContentRouter()
+    page = '<html><body><p>Hi</p><script>{"a": 1}</script></body></html>'
+    _stub_embedded_router(monkeypatch, "<EMBEDDED-JSON-ROUTED>")
+
+    monkeypatch.setattr(router, "_get_html_extractor", lambda: object())
+    monkeypatch.setattr(router, "_registry_compress", lambda *_a, **_kw: None)
+    monkeypatch.setattr(router, "_try_ml_compressor", lambda *_a, **_kw: (None, None))
+
+    compressed, compressed_tokens, strategy_chain = router._apply_strategy_to_content(
+        page,
+        CompressionStrategy.HTML,
+        context="",
+    )
+
+    assert compressed == "<EMBEDDED-JSON-ROUTED>"
+    assert compressed_tokens == _estimate_tokens("<EMBEDDED-JSON-ROUTED>")
+    assert strategy_chain == ["html", "embedded_json"]
+
+
+def test_embedded_json_still_short_circuits_non_html_strategies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only HTML defers; every other strategy keeps the early return."""
+    router = ContentRouter()
+    blob = 'prefix {"a": 1} suffix'
+    _stub_embedded_router(monkeypatch, "<EMBEDDED-JSON-ROUTED>")
+
+    compressed, compressed_tokens, strategy_chain = router._apply_strategy_to_content(
+        blob,
+        CompressionStrategy.TEXT,
+        context="",
+    )
+
+    assert compressed == "<EMBEDDED-JSON-ROUTED>"
+    assert compressed_tokens == _estimate_tokens("<EMBEDDED-JSON-ROUTED>")
+    assert strategy_chain == ["embedded_json"]
