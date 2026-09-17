@@ -2087,3 +2087,129 @@ def test_embedded_json_still_short_circuits_non_html_strategies(
     assert compressed == "<EMBEDDED-JSON-ROUTED>"
     assert compressed_tokens == _estimate_tokens("<EMBEDDED-JSON-ROUTED>")
     assert strategy_chain == ["embedded_json"]
+
+
+def _html_page(*, blank_run: bool) -> str:
+    """A small HTML page with one embedded JSON value.
+
+    ``blank_run`` inserts a 100-line blank run, which gives STAGE 0 a real
+    lossless fold: the shape the #3612 review reproduced.
+    """
+    gap = "\n" * 100 if blank_run else ""
+    return "<html><body><p>Hi</p>" + gap + '<script>{"a": 1}</script></body></html>'
+
+
+def test_lossless_fold_does_not_preempt_html_extraction_for_embedded_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#3609: the STAGE 0 fold return must not skip extraction either.
+
+    With a held embedded-JSON result, a page whose blank run folds used to
+    return the fold before the HTML dispatch, so extraction never ran.
+    """
+    router = ContentRouter()
+    page = _html_page(blank_run=True)
+    assert router._lossless_first(page, CompressionStrategy.HTML)[1] is not None
+    _stub_embedded_router(monkeypatch, "<EMBEDDED-JSON-ROUTED>")
+    dispatched: list[str] = []
+
+    def fake_registry(name: str, *_a: object, **_kw: object) -> SimpleNamespace:
+        dispatched.append(name)
+        return SimpleNamespace(content="<HTML-EXTRACTED>", compressed=True)
+
+    monkeypatch.setattr(router, "_get_html_extractor", lambda: object())
+    monkeypatch.setattr(router, "_registry_compress", fake_registry)
+    monkeypatch.setattr(router, "_try_ml_compressor", lambda *_a, **_kw: (None, None))
+
+    compressed, _tokens, strategy_chain = router._apply_strategy_to_content(
+        page,
+        CompressionStrategy.HTML,
+        context="",
+    )
+
+    assert dispatched == ["html"]
+    assert compressed == "<HTML-EXTRACTED>"
+    assert strategy_chain == ["html"]
+
+
+@pytest.mark.parametrize("blank_run", [False, True])
+@pytest.mark.parametrize("extraction", ["disabled", "unavailable", "raises", "empty", "blank"])
+def test_embedded_json_is_returned_when_html_extraction_yields_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    extraction: str,
+    blank_run: bool,
+) -> None:
+    """Every extraction miss must return the held embedded-JSON result.
+
+    That covers a disabled, missing, or failing extractor and the empty string
+    the adapter passes through when no article text is found, with and without
+    a lossless fold on the page. A fold must never replace the held result,
+    and an empty extraction must never blank the block.
+    """
+    router = ContentRouter()
+    page = _html_page(blank_run=blank_run)
+    folds = router._lossless_first(page, CompressionStrategy.HTML)[1] is not None
+    assert folds is blank_run
+    _stub_embedded_router(monkeypatch, "<EMBEDDED-JSON-ROUTED>")
+    monkeypatch.setattr(router, "_try_ml_compressor", lambda *_a, **_kw: (None, None))
+
+    if extraction == "disabled":
+        monkeypatch.setattr(router.config, "enable_html_extractor", False)
+    elif extraction == "unavailable":
+        monkeypatch.setattr(router, "_get_html_extractor", lambda: None)
+    else:
+        monkeypatch.setattr(router, "_get_html_extractor", lambda: object())
+        if extraction == "raises":
+
+            def failing_registry(*_a: object, **_kw: object) -> SimpleNamespace:
+                raise RuntimeError("extractor failed")
+
+            monkeypatch.setattr(router, "_registry_compress", failing_registry)
+        else:
+            text = "" if extraction == "empty" else " \n\t "
+            monkeypatch.setattr(
+                router,
+                "_registry_compress",
+                lambda *_a, **_kw: SimpleNamespace(content=text, compressed=True),
+            )
+
+    compressed, compressed_tokens, strategy_chain = router._apply_strategy_to_content(
+        page,
+        CompressionStrategy.HTML,
+        context="",
+    )
+
+    assert compressed == "<EMBEDDED-JSON-ROUTED>"
+    assert compressed_tokens == _estimate_tokens("<EMBEDDED-JSON-ROUTED>")
+    assert strategy_chain == ["html", "embedded_json"]
+
+
+def test_lossless_only_mode_keeps_the_embedded_json_early_return(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The HTML deferral is lossy-mode only.
+
+    Lossless-only mode stops at STAGE 0 and never reaches extraction, so
+    deferring there would trade the embedded result for a bare fold or
+    passthrough. It must return immediately, as before #3609.
+    """
+    router = ContentRouter(ContentRouterConfig(lossless=True))
+    page = _html_page(blank_run=True)
+    _stub_embedded_router(monkeypatch, "<EMBEDDED-JSON-ROUTED>")
+    dispatched: list[str] = []
+
+    def fake_registry(name: str, *_a: object, **_kw: object) -> None:
+        dispatched.append(name)
+
+    monkeypatch.setattr(router, "_registry_compress", fake_registry)
+
+    compressed, compressed_tokens, strategy_chain = router._apply_strategy_to_content(
+        page,
+        CompressionStrategy.HTML,
+        context="",
+    )
+
+    assert compressed == "<EMBEDDED-JSON-ROUTED>"
+    assert compressed_tokens == _estimate_tokens("<EMBEDDED-JSON-ROUTED>")
+    assert strategy_chain == ["embedded_json"]
+    assert dispatched == []
