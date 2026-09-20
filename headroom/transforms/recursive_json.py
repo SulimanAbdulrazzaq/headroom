@@ -31,7 +31,7 @@ Safety invariants (no thresholds — outcome-gated only):
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 
 _OPEN = "[{"
 _CLOSE = "]}"
@@ -115,6 +115,37 @@ def _has_routable_json(span: str) -> bool:
     return found
 
 
+def _routable_spans(content: str) -> Iterator[tuple[int, int, str]]:
+    """Yield ``(start, end, text)`` for every span ``route_embedded_json`` hands
+    to its dispatch: balanced, not the whole block, marker-free, and holding an
+    array of objects. Structural only — the dispatch is never called here."""
+    spans = _spans(content)
+    if not spans:
+        return
+    # Whole-block JSON is the caller's job, not ours.
+    if len(spans) == 1 and spans[0] == (0, len(content.strip())):
+        return
+    for a, b in spans:
+        chunk = content[a:b]
+        if "<<ccr:" in chunk:  # R1: already compressed — never re-route
+            continue
+        if not _has_routable_json(chunk):
+            continue
+        yield a, b, chunk
+
+
+def has_embedded_json(content: str) -> bool:
+    """True when :func:`route_embedded_json` would dispatch at least one span.
+
+    Lets a caller learn that an embedded-JSON result is *available* without
+    paying for it: this runs the span scan only, so no compressor runs, no
+    ``<<ccr:…>>`` marker is registered and no TOIN row is written. It stops at
+    the first routable span. ``True`` does not promise a smaller result — the
+    benefit gate stays in :func:`route_embedded_json`.
+    """
+    return any(True for _ in _routable_spans(content))
+
+
 def route_embedded_json(
     content: str,
     dispatch: Dispatch,
@@ -129,20 +160,9 @@ def route_embedded_json(
     caller already routes pure-JSON blocks; this exists for the *embedded* case.
     """
     tok = tok or (lambda s: max(1, len(s) // 4))
-    spans = _spans(content)
-    if not spans:
-        return None
-    # Whole-block JSON is the caller's job, not ours.
-    if len(spans) == 1 and spans[0] == (0, len(content.strip())):
-        return None
 
     repls: list[tuple[int, int, str]] = []
-    for a, b in spans:
-        chunk = content[a:b]
-        if "<<ccr:" in chunk:  # R1: already compressed — never re-route
-            continue
-        if not _has_routable_json(chunk):
-            continue
+    for a, b, chunk in _routable_spans(content):
         out = dispatch(chunk)
         if out is None or out == chunk:
             continue

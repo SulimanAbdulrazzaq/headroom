@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 
-from headroom.transforms.recursive_json import route_embedded_json
+from headroom.transforms.recursive_json import has_embedded_json, route_embedded_json
 
 
 def _upper_dispatch(span: str) -> str | None:
@@ -65,3 +65,42 @@ def test_scalar_array_not_routed() -> None:
     # array of scalars is not a "routable" JSON shape (no dict rows)
     content = "nums: [1,2,3,4,5,6,7,8] done"
     assert route_embedded_json(content, _upper_dispatch) is None
+
+
+# --- has_embedded_json: the same span scan, without the dispatch -----------
+#
+# The router uses it to find out whether an embedded-JSON fallback is
+# available before deciding to defer to the HTML extractor, so it must agree
+# with route_embedded_json on exactly which blocks have a routable span — and
+# must get there without running any compressor.
+
+
+def test_has_embedded_json_true_for_a_routable_span() -> None:
+    payload = json.dumps([{"id": i, "ok": True} for i in range(6)], separators=(",", ":"))
+    assert has_embedded_json(f"Fetched rows from API:\n{payload}\nDone (200 OK).") is True
+
+
+def test_has_embedded_json_agrees_with_the_router_on_skipped_shapes() -> None:
+    # Every shape route_embedded_json refuses to dispatch reports False here.
+    whole_block = json.dumps([{"a": i} for i in range(5)], separators=(",", ":"))
+    marked = 'prefix [{"a":1,"b":2},{"a":3,"b":"<<ccr:deadbeef,json,900>>"}] suffix'
+    for content in (
+        "just prose, nothing structured here",
+        whole_block,  # the caller's job
+        marked,  # R1: already compressed
+        "nums: [1,2,3,4,5,6,7,8] done",  # no dict rows
+        'log line {"a": 1} tail',  # single object, not an array of objects
+    ):
+        assert has_embedded_json(content) is False
+        assert route_embedded_json(content, _upper_dispatch) is None
+
+
+def test_has_embedded_json_is_availability_not_benefit() -> None:
+    # The probe answers "is there a span to route?", not "will routing help?".
+    # The benefit gate stays in route_embedded_json, so a caller that defers on
+    # a True must cope with a later None — which is what the router's fallback
+    # to the STAGE 0 fold is for.
+    payload = json.dumps([{"a": i} for i in range(5)], separators=(",", ":"))
+    content = f"x {payload} y"
+    assert has_embedded_json(content) is True
+    assert route_embedded_json(content, lambda s: s + " " * 999) is None

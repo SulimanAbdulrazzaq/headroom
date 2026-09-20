@@ -3405,9 +3405,15 @@ class ContentRouter(Transform):
         # call is a one-shot re-entrancy guard (NOT a depth cap). Deterministic +
         # benefit-gated (no size/min thresholds) → prefix-cache- and CCR-store-
         # stable, and a strict no-op when the block has no embedded JSON.
-        embedded_fallback: str | None = None
+        # `embedded_fallback` is the *deferred* route, not its result: a thunk,
+        # set only on the HTML path, that is called at most once and only after
+        # extraction has come up empty (see the fallback at the bottom).
+        embedded_fallback: Callable[[], str | None] | None = None
         if _allow_embedded:
-            from headroom.transforms.recursive_json import route_embedded_json
+            from headroom.transforms.recursive_json import (
+                has_embedded_json,
+                route_embedded_json,
+            )
 
             def _dispatch_span(span: str) -> str | None:
                 strat = self._strategy_from_detection_type(_detect_content(span).content_type)
@@ -3421,19 +3427,28 @@ class ContentRouter(Transform):
                 )
                 return text if text != span else None
 
-            routed = route_embedded_json(content, _dispatch_span, tok=_estimate_tokens)
-            if routed is not None:
-                if strategy is not CompressionStrategy.HTML or self.config.lossless:
+            def _route_embedded() -> str | None:
+                return route_embedded_json(content, _dispatch_span, tok=_estimate_tokens)
+
+            if strategy is not CompressionStrategy.HTML or self.config.lossless:
+                routed = _route_embedded()
+                if routed is not None:
                     return routed, _estimate_tokens(routed), ["embedded_json"]
+            elif has_embedded_json(content):
                 # HTML owns the whole document: HTMLExtractor drops navigation,
                 # scripts and styling, which routinely banks far more than
-                # shrinking one embedded span, so returning here would trade a
-                # document-level win for a local one (#3609). Hold the embedded
-                # result instead: extraction gets first refusal, and the held
-                # result is returned unchanged whenever extraction yields
-                # nothing. Lossless-only mode keeps the immediate return above,
-                # because it stops at STAGE 0 and never reaches extraction.
-                embedded_fallback = routed
+                # shrinking one embedded span, so routing here would trade a
+                # document-level win for a local one (#3609). Defer instead —
+                # extraction gets first refusal and the embedded route runs only
+                # if it yields nothing. Deferring the CALL, not just the return,
+                # is what keeps a successful HTML request off the nested
+                # compressor: no JSON-compression cost and no CCR/TOIN state for
+                # a result that would be discarded. `has_embedded_json` is the
+                # span scan alone — no dispatch, no markers, no TOIN — so all it
+                # settles is whether a fallback is available at all.
+                # Lossless-only mode keeps the immediate return above, because
+                # it stops at STAGE 0 and never reaches extraction.
+                embedded_fallback = _route_embedded
 
         # Track original tokens for TOIN recording
         original_tokens = _estimate_tokens(content)
@@ -3492,43 +3507,23 @@ class ContentRouter(Transform):
                 return split, _estimate_tokens(split), [kind, "relevance_split"]
 
         # No relevance split adopted → return the STAGE 0 lossless fold as the
-        # floor. Lossless-then-lossy: before returning, run the aggressive lossy
-        # compressor on the byte-folded remainder and keep it IFF it removes a
-        # further meaningful chunk (Kompress must save >= _lossy_min_extra_savings
-        # beyond the fold). Keeps the fold AND reclaims the semantic word-drop
-        # tail, never doing worse than the fold. DIFF folds are returned verbatim
-        # — Kompressing hunks corrupts `git apply`.
-        # An HTML block holding an embedded-JSON result skips this return
+        # floor (see `_lossless_fold_result` for the lossless-then-lossy layer
+        # it applies on the way out).
+        # An HTML block with a deferred embedded-JSON route skips this return
         # (#3609): returning the fold here bypasses document-level extraction,
-        # and a blank-run fold can keep far more than the held result. That
+        # and a blank-run fold can keep far more than the embedded result. That
         # result, not the fold, is what such a block returned before the
-        # deferral, so extraction runs below with it as the fallback.
+        # deferral, so extraction runs below — and if it and the embedded route
+        # both come up empty, the fallback returns this same fold.
+        # Deferring means this skip keys on a route being AVAILABLE, not on its
+        # result: a folding page whose span is routable but comes back no
+        # smaller now reaches the extractor, where the pre-pass returned the
+        # fold. That is the document-level extraction #3609 asks for, and it is
+        # the only way to skip without paying for the result first.
         if _ll_label is not None and embedded_fallback is None:
-            _lossy_after_fold = (
-                self._lossless_then_lossy
-                and strategy != CompressionStrategy.DIFF
-                and _ll_label != "lossless_diff"
-                and not self._looks_like_diff(content)
+            return self._lossless_fold_result(
+                content, strategy, _ll_content, _ll_label, context, question
             )
-            if _lossy_after_fold:
-                _fold_tokens = _estimate_tokens(_ll_content)
-                try:
-                    _komp, _komp_tokens = self._try_ml_compressor(_ll_content, context, question)
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("lossy-after-fold failed: %s", exc)
-                    _komp, _komp_tokens = None, None
-                if (
-                    _komp is not None
-                    and _komp_tokens is not None
-                    and _komp_tokens <= _fold_tokens * (1 - self._lossy_min_extra_savings)
-                    and len(_komp) < len(_ll_content)
-                ):
-                    return (
-                        _komp,
-                        _komp_tokens,
-                        [_ll_label, CompressionStrategy.KOMPRESS.value],
-                    )
-            return _ll_content, _estimate_tokens(_ll_content), [_ll_label]
 
         # CCR/lossy mode, nothing foldable (code/json/text/mixed) and no relevance
         # split → fall through to the lossy compressors below (kompress /
@@ -3801,12 +3796,25 @@ class ContentRouter(Transform):
 
         # The HTML extractor produced nothing: it is disabled or unavailable,
         # it raised, or it found no article text (the adapter reports
-        # trafilatura's empty string as a successful result). Return the
-        # embedded-JSON result held back above exactly as the pre-pass would
-        # have, instead of a blank block or passthrough (#3609).
+        # trafilatura's empty string as a successful result). Only NOW route the
+        # embedded JSON, and return it exactly as the pre-pass would have,
+        # instead of a blank block or passthrough (#3609).
         if embedded_fallback is not None and not (compressed or "").strip():
-            strategy_chain.append("embedded_json")
-            return embedded_fallback, _estimate_tokens(embedded_fallback), strategy_chain
+            routed = embedded_fallback()
+            if routed is not None:
+                strategy_chain.append("embedded_json")
+                return routed, _estimate_tokens(routed), strategy_chain
+            # The spans were routable but nothing came back smaller, so there is
+            # no embedded result to bank and the deferral bought nothing. Return
+            # the STAGE 0 fold this block skipped on the way in: without this the
+            # deferral would drop a byte-exact win `main` returns here.
+            # `requested_strategy`, not `strategy` — the dispatch above can
+            # rebind `strategy` (CODE_AWARE → KOMPRESS), and the fold was taken
+            # for the requested one.
+            if _ll_label is not None:
+                return self._lossless_fold_result(
+                    content, requested_strategy, _ll_content, _ll_label, context, question
+                )
 
         # If compression succeeded, record to TOIN
         if compressed is not None and compressed_tokens is not None:
@@ -3983,6 +3991,53 @@ class ContentRouter(Transform):
                 error=error,
             )
         return content, original_tokens, strategy_chain
+
+    def _lossless_fold_result(
+        self,
+        content: str,
+        strategy: CompressionStrategy,
+        folded: str,
+        label: str,
+        context: str,
+        question: str | None,
+    ) -> tuple[str, int, list[str]]:
+        """Return the STAGE 0 lossless fold as this block's result.
+
+        Lossless-then-lossy: before returning, run the aggressive lossy
+        compressor on the byte-folded remainder and keep it IFF it removes a
+        further meaningful chunk (Kompress must save >=
+        ``_lossy_min_extra_savings`` beyond the fold). Keeps the fold AND
+        reclaims the semantic word-drop tail, never doing worse than the fold.
+        DIFF folds are returned verbatim — Kompressing hunks corrupts
+        ``git apply``.
+
+        Called from the STAGE 0 return and, for an HTML block that deferred to
+        the extractor, from the fallback below it once extraction and the
+        embedded route have both come up empty — so deferring can never cost a
+        block the fold it would otherwise have returned. Lazy on purpose: the
+        Kompress call inside runs only for whichever call site actually returns.
+        """
+        lossy_after_fold = (
+            self._lossless_then_lossy
+            and strategy != CompressionStrategy.DIFF
+            and label != "lossless_diff"
+            and not self._looks_like_diff(content)
+        )
+        if lossy_after_fold:
+            fold_tokens = _estimate_tokens(folded)
+            try:
+                komp, komp_tokens = self._try_ml_compressor(folded, context, question)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("lossy-after-fold failed: %s", exc)
+                komp, komp_tokens = None, None
+            if (
+                komp is not None
+                and komp_tokens is not None
+                and komp_tokens <= fold_tokens * (1 - self._lossy_min_extra_savings)
+                and len(komp) < len(folded)
+            ):
+                return komp, komp_tokens, [label, CompressionStrategy.KOMPRESS.value]
+        return folded, _estimate_tokens(folded), [label]
 
     def _try_ml_compressor(
         self,
