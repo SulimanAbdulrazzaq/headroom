@@ -65,6 +65,15 @@ def _extract_from_zip(data: bytes, target_path: Path) -> None:
     raise RuntimeError("codebase-memory-mcp binary not found in archive")
 
 
+def _installed_name(plat: str) -> str:
+    """Return the file name to install the binary under for ``plat``.
+
+    On Windows, ``shutil.which`` (and so a PATH lookup) only finds a binary
+    whose name ends in a PATHEXT extension such as ``.exe``.
+    """
+    return f"{CBM_BIN_NAME}.exe" if plat.startswith("windows") else CBM_BIN_NAME
+
+
 def get_cbm_path() -> Path | None:
     """Find codebase-memory-mcp binary, return path or None."""
     # Check PATH first
@@ -73,7 +82,7 @@ def get_cbm_path() -> Path | None:
         return Path(found)
 
     # Check our install location
-    installed = CBM_BIN_DIR / CBM_BIN_NAME
+    installed = CBM_BIN_DIR / _installed_name(platform.system().lower())
     if installed.exists() and installed.is_file():
         return installed
 
@@ -91,7 +100,7 @@ def download_cbm(version: str | None = None) -> Path:
     url = f"{GITHUB_RELEASE_URL}/{version}/{filename}"
 
     CBM_BIN_DIR.mkdir(parents=True, exist_ok=True)
-    target_path = CBM_BIN_DIR / CBM_BIN_NAME
+    target_path = CBM_BIN_DIR / _installed_name(plat)
 
     logger.info("Downloading codebase-memory-mcp %s for %s ...", version, plat)
 
