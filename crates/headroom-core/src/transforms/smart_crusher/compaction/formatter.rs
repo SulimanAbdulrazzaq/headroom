@@ -810,6 +810,10 @@ mod tests {
 
     #[test]
     fn csv_formatter_json_column_quotes_strings_that_parse_as_json() {
+        // The cells are built by hand to pin the formatter's contract. Through
+        // `compact`, a string that parses as a JSON array or object (`[1]`,
+        // `{"a":1}`) never reaches the formatter as a string: the classifier
+        // un-escapes it first (`CellClass::StringifiedJson`).
         // (string value, the JSON string literal it is rendered as)
         let cases = [
             ("null", r#""null""#),
